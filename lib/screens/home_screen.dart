@@ -10,6 +10,7 @@ import 'HomeScreenComponents/AddTaskSheet.dart';
 import 'HomeScreenComponents/TaskListItem.dart';
 import 'HomeScreenComponents/TopBar.dart';
 import 'HomeScreenComponents/TaskSection.dart';
+import './notes_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({Key? key}) : super(key: key);
@@ -52,7 +53,9 @@ class _HomeScreenState extends State<HomeScreen> {
   List<Widget> get _pages => [
     _HomePageBody(onAdd: () => _showAddDialog(context)),
     TaskListScreen(),
+    NotesScreen(),
     SettingsScreen(),
+
   ];
 
   @override
@@ -73,6 +76,7 @@ class _HomeScreenState extends State<HomeScreen> {
           items: const [
             BottomNavigationBarItem(icon: Icon(Icons.home), label: "Home"),
             BottomNavigationBarItem(icon: Icon(Icons.list_alt), label: "Tasks"),
+            BottomNavigationBarItem(icon: Icon(Icons.note), label: "Notes"),
             BottomNavigationBarItem(icon: Icon(Icons.person), label: "Profile"),
           ],
         ),

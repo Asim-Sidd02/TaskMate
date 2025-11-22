@@ -1,61 +1,92 @@
 // lib/services/auth_service.dart
-import 'dart:convert';
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import '../config.dart';
 
 class AuthService extends ChangeNotifier {
-  final storage = const FlutterSecureStorage();
-  final String baseUrl = AppConfig.baseUrl; // ensure this is correct
+  final FlutterSecureStorage storage = const FlutterSecureStorage();
+  final String baseUrl = AppConfig.baseUrl; // e.g. https://taskapi-1-zwcj.onrender.com
 
   // public state
-  bool initializing = true; // true while init() runs
+  bool initializing = true;
   bool _loggedIn = false;
   bool get loggedIn => _loggedIn;
 
   String? accessToken;
   String? refreshToken;
-  Map<String, dynamic>? me; // optional profile object if backend provides /auth/me
+  Map<String, dynamic>? me;
 
   // network timeout
-  Duration _timeout = const Duration(seconds: 30); // increased for reliability
+  Duration _timeout = const Duration(seconds: 30);
+
+  // Simple guard to avoid multiple concurrent refresh attempts
+  Completer<bool>? _refreshCompleter;
 
   AuthService();
 
-  /// Initialize AuthService: load tokens from secure storage and validate (optional)
+  // ---------- Debug helpers ----------
+  void _debugDumpTokens(String where) {
+    try {
+      debugPrint('[AuthService] $where: access=${accessToken != null} refresh=${refreshToken != null} (inMemory)');
+    } catch (e) {
+      debugPrint('[AuthService] _debugDumpTokens error: $e');
+    }
+  }
+
+  Future<void> debugReadStoredKeys() async {
+    try {
+      final a = await storage.read(key: "access");
+      final r = await storage.read(key: "refresh");
+      debugPrint('[AuthService] storage read: accessPresent=${a != null} refreshPresent=${r != null}');
+      debugPrint('[AuthService] storage lengths: access=${a?.length ?? 0} refresh=${r?.length ?? 0}');
+      if (a != null) debugPrint('[AuthService] storage access prefix: ${a.substring(0, a.length > 16 ? 16 : a.length)}...');
+    } catch (e) {
+      debugPrint('[AuthService] debugReadStoredKeys error: $e');
+    }
+  }
+
+  // ---------- Initialization ----------
   Future<void> init() async {
     initializing = true;
     notifyListeners();
 
     try {
-      accessToken = await storage.read(key: "access");
-      refreshToken = await storage.read(key: "refresh");
+      // read from storage into memory
+      try {
+        accessToken = await storage.read(key: "access");
+        refreshToken = await storage.read(key: "refresh");
+        debugPrint('[AuthService] init: read storage done');
+      } catch (e) {
+        debugPrint('[AuthService] init: storage read failed: $e');
+      }
+
+      _debugDumpTokens('init(read)');
 
       if (accessToken != null) {
-        // Optionally verify token by fetching profile; if it fails try refresh
-        final ok = await tryFetchProfile();
-        if (!ok) {
-          // attempt refresh if profile fetch failed
+        // Try to validate access token by fetching profile (no auto-refresh on this call)
+        final ok = await tryFetchProfile(autoRefresh: false);
+        if (ok) {
+          _loggedIn = true;
+        } else {
+          // Try refreshing tokens once
           final refreshed = await _refreshToken();
           if (refreshed) {
-            await tryFetchProfile();
+            final ok2 = await tryFetchProfile(autoRefresh: false);
+            _loggedIn = ok2;
           } else {
-            // tokens invalid, clear
             await _clearTokensLocal();
             _loggedIn = false;
           }
-        } else {
-          _loggedIn = true;
         }
       } else if (refreshToken != null) {
-        // we have only refresh token — try to exchange for access
+        // No access but have refresh -> try exchange
         final refreshed = await _refreshToken();
         if (refreshed) {
-          final ok = await tryFetchProfile();
+          final ok = await tryFetchProfile(autoRefresh: false);
           _loggedIn = ok;
         } else {
           _loggedIn = false;
@@ -64,33 +95,59 @@ class AuthService extends ChangeNotifier {
         _loggedIn = false;
       }
     } catch (e) {
-      // defensive: if anything goes wrong, mark not logged in
       debugPrint('[AuthService] init error: $e');
       _loggedIn = false;
     } finally {
       initializing = false;
+      _debugDumpTokens('init done');
+      debugPrint('[AuthService] init: loggedIn=$_loggedIn');
       notifyListeners();
     }
   }
 
-  /// Attempt to fetch profile from backend (/auth/me). Returns true on success.
-  Future<bool> tryFetchProfile() async {
-    if (accessToken == null) return false;
+  /// Fetch current user profile. Returns true on HTTP 200 and sets `me`.
+  /// If autoRefresh==true the method will attempt to refresh tokens on 401 once.
+  Future<bool> tryFetchProfile({bool autoRefresh = true}) async {
+    final token = accessToken ?? await storage.read(key: "access");
+    if (token == null) return false;
+
     try {
-      final res = await http.get(Uri.parse("$baseUrl/auth/me"),
-          headers: {
-            "Authorization": "Bearer $accessToken",
-            "Content-Type": "application/json"
-          }).timeout(const Duration(seconds: 8));
+      final res = await http
+          .get(
+        Uri.parse("$baseUrl/auth/me"),
+        headers: {
+          "Authorization": "Bearer $token",
+          "Content-Type": "application/json",
+        },
+      )
+          .timeout(const Duration(seconds: 8));
+
+      debugPrint('[AuthService] tryFetchProfile status=${res.statusCode} body=${res.body}');
 
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         if (data is Map) {
           me = Map<String, dynamic>.from(data);
         }
+        _loggedIn = true;
+        notifyListeners();
         return true;
       }
 
+      if (res.statusCode == 401 && autoRefresh) {
+        debugPrint('[AuthService] tryFetchProfile: 401, attempting refresh');
+        final refreshed = await _refreshToken();
+        if (!refreshed) return false;
+        // try again once
+        return await tryFetchProfile(autoRefresh: false);
+      }
+
+      return false;
+    } on TimeoutException {
+      debugPrint('[AuthService] tryFetchProfile timeout');
+      return false;
+    } on SocketException catch (e) {
+      debugPrint('[AuthService] tryFetchProfile network error: ${e.message}');
       return false;
     } catch (e) {
       debugPrint('[AuthService] tryFetchProfile error: $e');
@@ -98,215 +155,255 @@ class AuthService extends ChangeNotifier {
     }
   }
 
-  /// Exchange refresh token for a new access token. Returns true if refreshed.
+  // ---------- Token refresh ----------
   Future<bool> _refreshToken() async {
-    final refresh = refreshToken ?? await storage.read(key: "refresh");
-    if (refresh == null) return false;
+    if (_refreshCompleter != null) {
+      return _refreshCompleter!.future;
+    }
+    _refreshCompleter = Completer<bool>();
 
+    final refresh = refreshToken ?? await storage.read(key: "refresh");
+    if (refresh == null) {
+      debugPrint('[AuthService] _refreshToken: no refresh token available');
+      _refreshCompleter!.complete(false);
+      _refreshCompleter = null;
+      return false;
+    }
+
+    debugPrint('[AuthService] attempting refresh (haveRefresh=true)');
+
+    http.Response? res;
     try {
-      final res = await http
-          .post(Uri.parse("$baseUrl/auth/refresh"),
-          headers: {"Content-Type": "application/json"}, body: jsonEncode({"refreshToken": refresh}))
+      res = await http
+          .post(
+        Uri.parse("$baseUrl/auth/refresh"),
+        headers: {"Content-Type": "application/json"},
+        body: jsonEncode({"refreshToken": refresh}),
+      )
           .timeout(const Duration(seconds: 10));
+
+      debugPrint('[AuthService] refresh status=${res.statusCode} body=${res.body}');
 
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         final newAccess = data["accessToken"] ?? data["access"];
         final newRefresh = data["refreshToken"] ?? data["refresh"];
-        if (newAccess != null) {
-          accessToken = newAccess.toString();
-          await storage.write(key: "access", value: accessToken);
+
+        try {
+          if (newAccess != null) {
+            accessToken = newAccess.toString();
+            await storage.write(key: "access", value: accessToken);
+          }
+          if (newRefresh != null) {
+            refreshToken = newRefresh.toString();
+            await storage.write(key: "refresh", value: refreshToken);
+          }
+        } catch (e) {
+          debugPrint('[AuthService] refresh: storage write failed: $e');
         }
-        if (newRefresh != null) {
-          refreshToken = newRefresh.toString();
-          await storage.write(key: "refresh", value: refreshToken);
-        }
+
+        _debugDumpTokens('refresh success');
         notifyListeners();
+        _refreshCompleter!.complete(true);
+        _refreshCompleter = null;
         return true;
       } else {
-        // refresh failed; clear tokens
+        debugPrint('[AuthService] refresh failed (status ${res.statusCode})');
         await _clearTokensLocal();
         notifyListeners();
+        _refreshCompleter!.complete(false);
+        _refreshCompleter = null;
         return false;
       }
     } on TimeoutException {
       debugPrint('[AuthService] refresh token timed out');
+      _refreshCompleter!.complete(false);
+      _refreshCompleter = null;
       return false;
     } on SocketException catch (e) {
       debugPrint('[AuthService] refresh token network error: ${e.message}');
+      _refreshCompleter!.complete(false);
+      _refreshCompleter = null;
       return false;
     } catch (e) {
       debugPrint('[AuthService] refresh token error: $e');
+      if (res != null) debugPrint('[AuthService] refresh last response: ${res.body}');
+      _refreshCompleter!.complete(false);
+      _refreshCompleter = null;
       return false;
     }
   }
 
-  /// Public: get access token (reads from memory first)
-  Future<String?> getAccessToken() async => accessToken ?? await storage.read(key: "access");
+  // ---------- Ensure access token ----------
+  Future<String?> ensureAccessToken() async {
+    if (accessToken != null) return accessToken;
 
+    try {
+      final stored = await storage.read(key: "access");
+      if (stored != null) {
+        accessToken = stored;
+        _debugDumpTokens('ensureAccessToken loaded from storage');
+        return accessToken;
+      }
+    } catch (e) {
+      debugPrint('[AuthService] ensureAccessToken storage read failed: $e');
+    }
+
+    // attempt refresh
+    final refreshed = await _refreshToken();
+    if (refreshed) return accessToken;
+    return null;
+  }
+
+  Future<String?> getAccessToken() async => accessToken ?? await storage.read(key: "access");
   Future<String?> getRefreshToken() async => refreshToken ?? await storage.read(key: "refresh");
 
-  /// Login with email/password. Returns true on success.
+  // ---------- Auth API: login/register/refresh/logout ----------
   Future<bool> login(String email, String password) async {
-    final url = Uri.parse("$baseUrl/auth/login");
-    debugPrint("[AuthService] LOGIN URL: $url");
+    final urlPath = "/auth/login";
     try {
       final res = await http
           .post(
-        url,
+        Uri.parse("$baseUrl$urlPath"),
         headers: {"Content-Type": "application/json"},
         body: jsonEncode({"email": email, "password": password}),
       )
           .timeout(_timeout);
 
-      debugPrint("LOGIN: status=${res.statusCode}, body=${res.body}");
+      debugPrint('[AuthService] login status=${res.statusCode} body=${res.body}');
 
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         final a = data["accessToken"] ?? data["access"];
         final r = data["refreshToken"] ?? data["refresh"];
 
-        if (a != null) {
-          accessToken = a.toString();
-          await storage.write(key: "access", value: accessToken);
-        }
-        if (r != null) {
-          refreshToken = r.toString();
-          await storage.write(key: "refresh", value: refreshToken);
+        try {
+          if (a != null) {
+            accessToken = a.toString();
+            await storage.write(key: "access", value: accessToken);
+          }
+          if (r != null) {
+            refreshToken = r.toString();
+            await storage.write(key: "refresh", value: refreshToken);
+          }
+        } catch (e) {
+          debugPrint('[AuthService] login: storage write failed: $e');
         }
 
+        _debugDumpTokens('after login (saved)');
+        debugPrint('[AuthService] login success; access preview=${accessToken?.substring(0, 16)}...');
         _loggedIn = true;
-        // try to fetch profile, but don't fail login if profile isn't available
-        await tryFetchProfile();
         notifyListeners();
+        await tryFetchProfile(autoRefresh: false);
         return true;
       }
 
-      // helpful: include server message if present
-      try {
-        final parsed = jsonDecode(res.body);
-        if (parsed is Map && parsed["message"] != null) {
-          throw Exception("Login failed: ${parsed["message"]}");
-        }
-      } catch (_) {}
-
-      throw Exception("Login failed: HTTP ${res.statusCode}");
+      final parsedMsg = _parseErrorFromResponse(res);
+      debugPrint('[AuthService] login failed: $parsedMsg');
+      return false;
     } on TimeoutException {
-      throw Exception("Login request timed out after ${_timeout.inSeconds}s");
+      debugPrint('[AuthService] Login request timed out after ${_timeout.inSeconds}s');
+      return false;
     } on SocketException catch (e) {
-      throw Exception("Network error during login: ${e.message}");
+      debugPrint('[AuthService] Network error during login: ${e.message}');
+      return false;
     } catch (e) {
-      throw Exception("Login error: $e");
+      debugPrint('[AuthService] Login error: $e');
+      return false;
     }
   }
 
-  /// Register then login. Returns true on success.
-  /// Register then login. Returns true on success.
-  /// Improved error parsing and diagnostics.
-  Future<bool> register(String email, String password) async {
-    final url = Uri.parse("$baseUrl/auth/register");
-    debugPrint("[AuthService] REGISTER URL: $url");
+  Future<bool> register(String username, String email, String password) async {
+    final urlPath = "/auth/register";
     try {
       final res = await http
           .post(
-        url,
+        Uri.parse("$baseUrl$urlPath"),
         headers: {"Content-Type": "application/json"},
-        body: jsonEncode({"email": email, "password": password}),
+        body: jsonEncode({"username": username, "email": email, "password": password}),
       )
           .timeout(_timeout);
 
-      debugPrint("REGISTER: status=${res.statusCode}, body=${res.body}");
+      debugPrint('[AuthService] register status=${res.statusCode} body=${res.body}');
 
       if (res.statusCode == 201 || res.statusCode == 200) {
-        // If backend registers but doesn't auto-login, attempt login as before.
-        final loginOk = await login(email, password);
-        if (!loginOk) throw Exception("Registered but unable to log in.");
+        // Try to capture tokens if returned
+        try {
+          final data = jsonDecode(res.body);
+          final a = data["accessToken"] ?? data["access"];
+          final r = data["refreshToken"] ?? data["refresh"];
+          if (a != null) {
+            accessToken = a.toString();
+            await storage.write(key: "access", value: accessToken);
+          }
+          if (r != null) {
+            refreshToken = r.toString();
+            await storage.write(key: "refresh", value: refreshToken);
+          }
+        } catch (_) {}
+
+        _debugDumpTokens('after register');
+        debugPrint('[AuthService] register finished; loggedIn=$_loggedIn');
+
+        // If the server didn't return tokens, attempt to login automatically
+        if (accessToken == null) {
+          final loginOk = await login(email, password);
+          if (!loginOk) {
+            debugPrint('[AuthService] register: fallback login failed');
+            return false;
+          }
+        } else {
+          _loggedIn = true;
+          notifyListeners();
+          await tryFetchProfile(autoRefresh: false);
+        }
+
         return true;
       }
 
-      // parse error message(s) from response (many backend formats supported)
       final parsedMsg = _parseErrorFromResponse(res);
-      throw Exception(parsedMsg);
+      debugPrint('[AuthService] register failed: $parsedMsg');
+      return false;
     } on TimeoutException {
-      // optional: one retry
-      debugPrint("Registration timed out; retrying once...");
-      try {
-        final res = await http
-            .post(
-          url,
-          headers: {"Content-Type": "application/json"},
-          body: jsonEncode({"email": email, "password": password}),
-        )
-            .timeout(_timeout);
-        debugPrint("REGISTER (retry): status=${res.statusCode}, body=${res.body}");
-        if (res.statusCode == 201 || res.statusCode == 200) {
-          final loginOk = await login(email, password);
-          if (!loginOk) throw Exception("Registered but unable to log in.");
-          return true;
-        }
-        final parsedMsg = _parseErrorFromResponse(res);
-        throw Exception(parsedMsg);
-      } on TimeoutException {
-        throw Exception("Registration request timed out after ${_timeout.inSeconds}s (retry failed)");
-      } on SocketException catch (e) {
-        throw Exception("Network error during registration (retry): ${e.message}");
-      } catch (e) {
-        throw Exception("Registration error (retry): $e");
-      }
+      debugPrint('[AuthService] Registration request timed out after ${_timeout.inSeconds}s');
+      return false;
     } on SocketException catch (e) {
-      throw Exception("Network error during registration: ${e.message}");
+      debugPrint('[AuthService] Network error during registration: ${e.message}');
+      return false;
     } catch (e) {
-      throw Exception("Registration error: $e");
+      debugPrint('[AuthService] Registration error: $e');
+      return false;
     }
   }
 
-  /// Helper: parse error text from http.Response.
-  ///
-  /// Tries common shapes:
-  /// - { "message": "..." }
-  /// - { "error": "..." }
-  /// - { "errors": ["a","b"] } or { "errors": { "email": ["..."], "password": ["..."] } }
-  /// - raw text fallback
   String _parseErrorFromResponse(http.Response res) {
     try {
-      if (res.body.isEmpty) return "Registration failed (empty response, HTTP ${res.statusCode})";
+      if (res.body.trimLeft().startsWith('<')) {
+        return "Server returned non-JSON response (HTML). Check API baseUrl and that backend is running. HTTP ${res.statusCode}";
+      }
+      if (res.body.isEmpty) return "Request failed (empty response, HTTP ${res.statusCode})";
 
       final parsed = jsonDecode(res.body);
 
       if (parsed is String && parsed.isNotEmpty) return parsed;
 
       if (parsed is Map) {
-        // common keys
-        if (parsed.containsKey("message") && parsed["message"] != null) {
-          return parsed["message"].toString();
-        }
-        if (parsed.containsKey("error") && parsed["error"] != null) {
-          final err = parsed["error"];
-          if (err is String) return err;
-          return err.toString();
-        }
+        if (parsed.containsKey("message") && parsed["message"] != null) return parsed["message"].toString();
+        if (parsed.containsKey("error") && parsed["error"] != null) return parsed["error"].toString();
 
         if (parsed.containsKey("errors") && parsed["errors"] != null) {
           final errs = parsed["errors"];
-          // errors: array
-          if (errs is List) {
-            return errs.map((e) => e.toString()).join("; ");
-          }
-          // errors: map of field -> [messages]
+          if (errs is List) return errs.map((e) => e.toString()).join("; ");
           if (errs is Map) {
             final parts = <String>[];
             errs.forEach((k, v) {
-              if (v is List) {
-                parts.add("$k: ${v.map((e) => e.toString()).join(', ')}");
-              } else {
-                parts.add("$k: ${v.toString()}");
-              }
+              if (v is List) parts.add("$k: ${v.map((e) => e.toString()).join(', ')}");
+              else parts.add("$k: ${v.toString()}");
             });
             if (parts.isNotEmpty) return parts.join(" • ");
           }
         }
 
-        // sometimes backend returns validation like { "email": ["msg"] }
         final validationParts = <String>[];
         for (final entry in parsed.entries) {
           final key = entry.key.toString();
@@ -320,18 +417,15 @@ class AuthService extends ChangeNotifier {
         if (validationParts.isNotEmpty) return validationParts.join(" • ");
       }
 
-      // fallback: raw body
-      return "Registration failed: ${res.body}";
+      return "Request failed: ${res.body}";
     } catch (e) {
       debugPrint("[AuthService] parse error response failed: $e -- raw: ${res.body}");
-      return "Registration failed (HTTP ${res.statusCode})";
+      return "Request failed (HTTP ${res.statusCode})";
     }
   }
 
-
-  /// Logout: optional server call to revoke refresh, then clear local tokens.
   Future<void> logout() async {
-    final refresh = await storage.read(key: "refresh");
+    final refresh = refreshToken ?? await storage.read(key: "refresh");
 
     try {
       if (refresh != null) {
@@ -344,40 +438,25 @@ class AuthService extends ChangeNotifier {
             .timeout(const Duration(seconds: 8));
       }
     } catch (_) {
-      // ignore network/logout errors — we'll clear tokens locally anyway
+      // ignore network errors
     }
 
     await _clearTokensLocal();
-
     _loggedIn = false;
     me = null;
     notifyListeners();
+    debugPrint('[AuthService] logged out (local cleared)');
   }
 
-  /// Clear tokens from memory & storage (local only)
   Future<void> _clearTokensLocal() async {
     accessToken = null;
     refreshToken = null;
     try {
       await storage.delete(key: "access");
       await storage.delete(key: "refresh");
+      debugPrint('[AuthService] cleared tokens from storage');
     } catch (e) {
       debugPrint('[AuthService] failed to clear tokens: $e');
     }
-  }
-
-  /// Helper used by other services: returns an access token and attempts refresh on 401 if needed.
-  /// Example usage in your TaskService: call auth.getAccessToken() before requests.
-  Future<String?> ensureAccessToken() async {
-    if (accessToken != null) return accessToken;
-    final stored = await storage.read(key: "access");
-    if (stored != null) {
-      accessToken = stored;
-      return accessToken;
-    }
-    // attempt refresh if refresh token exists
-    final refreshed = await _refreshToken();
-    if (refreshed) return accessToken;
-    return null;
   }
 }

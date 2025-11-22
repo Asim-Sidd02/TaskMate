@@ -54,13 +54,18 @@ class _LoginScreenState extends State<LoginScreen> {
 
     return 'Login failed. Please check your credentials';
   }
-
   Future<void> _submit() async {
     final id = identifier.text.trim();
     final pass = password.text.trim();
 
     if (id.isEmpty || pass.isEmpty) {
       setState(() => _errorMessage = "Please fill all fields");
+      return;
+    }
+
+    // optional: basic email format check (you call it "identifier" but you use email)
+    if (!RegExp(r'^[^@]+@[^@]+\.[^@]+').hasMatch(id)) {
+      setState(() => _errorMessage = "Enter a valid email");
       return;
     }
 
@@ -73,24 +78,28 @@ class _LoginScreenState extends State<LoginScreen> {
       final auth = context.read<AuthService>();
       final success = await auth.login(id, pass);
 
-
       if (success == true) {
+        // debug: confirm tokens in secure storage
+        await auth.debugReadStoredKeys(); // check console for storage output
+
         if (!mounted) return;
         Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const HomeScreen()));
         return;
       }
 
-
-      setState(() => _errorMessage = "Login failed — wrong credentials");
-
+      // login returned false (server rejected or other error)
+      setState(() => _errorMessage = "Login failed — wrong credentials or server error");
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Login failed — check email/password or server logs')),
+      );
     } catch (e) {
-
       final classified = _classifyErrorMessage(e.toString());
       setState(() => _errorMessage = classified);
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
+
 
   InputDecoration _inputDecoration({required String hint, required IconData icon}) {
     return InputDecoration(

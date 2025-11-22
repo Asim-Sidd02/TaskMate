@@ -1,117 +1,141 @@
-import 'dart:convert';
+// lib/services/task_service.dart
 import 'dart:async';
-import 'package:flutter/material.dart';
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
 import '../config.dart';
+import 'auth_service.dart';
 
 class TaskService extends ChangeNotifier {
-  final storage = const FlutterSecureStorage();
-  final String baseUrl = AppConfig.baseUrl; // <- configurable
+  final String baseUrl = AppConfig.baseUrl; // e.g. https://taskapi-1-zwcj.onrender.com
 
-  /// Raw tasks as returned by the backend (List of Map<String, dynamic>)
-  List tasks = [];
+  AuthService? _auth;
+  List<dynamic> tasks = [];
   bool isLoading = false;
 
-  Future<String?> _getAccessToken() => storage.read(key: "access");
-  Future<String?> _getRefreshToken() => storage.read(key: "refresh");
-
-  /// Request a new access token using refresh token. Returns true if refreshed.
-  Future<bool> _refreshToken() async {
-    final refresh = await _getRefreshToken();
-    if (refresh == null) return false;
-    try {
-      final res = await http
-          .post(Uri.parse("$baseUrl/auth/refresh"),
-          headers: {"Content-Type": "application/json"},
-          body: jsonEncode({"refreshToken": refresh}))
-          .timeout(const Duration(seconds: 10));
-
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        await storage.write(key: "access", value: data["accessToken"]);
-        await storage.write(key: "refresh", value: data["refreshToken"]);
-        return true;
-      }
-      return false;
-    } catch (_) {
-      return false;
+  // call from ChangeNotifierProxyProvider.update to inject/refresh auth
+  void updateAuth(AuthService auth) {
+    _auth = auth;
+    debugPrint('[TaskService] updateAuth: loggedIn=${auth.loggedIn}');
+    if (_auth?.loggedIn == true) {
+      fetchTasks();
+    } else {
+      tasks = [];
+      notifyListeners();
     }
   }
 
-  /// Fetch tasks from backend and store in `tasks`.
+  Future<String?> _getValidAccessToken() async {
+    if (_auth == null) return null;
+    try {
+      final token = await _auth!.ensureAccessToken();
+      return token;
+    } catch (e) {
+      debugPrint('[TaskService] _getValidAccessToken error: $e');
+      return null;
+    }
+  }
+
+  // Helper to parse response for friendly messages
+  String _extractServerMessage(http.Response res) {
+    final body = res.body ?? '';
+    try {
+      if (body.trimLeft().startsWith('<')) {
+        return 'Server returned HTML (HTTP ${res.statusCode})';
+      }
+      final parsed = jsonDecode(body);
+      if (parsed is Map) {
+        if (parsed.containsKey('message')) return parsed['message'].toString();
+        if (parsed.containsKey('error')) return parsed['error'].toString();
+      }
+      return body;
+    } catch (e) {
+      return 'Failed to parse server response (HTTP ${res.statusCode})';
+    }
+  }
+
   Future<void> fetchTasks() async {
     isLoading = true;
     notifyListeners();
 
-    final token = await _getAccessToken();
+    final token = await _getValidAccessToken();
+    if (token == null) {
+      isLoading = false;
+      notifyListeners();
+      debugPrint('[TaskService] fetchTasks: no valid access token (user not authenticated)');
+      // Do NOT throw here; just clear tasks and exit gracefully.
+      tasks = [];
+      // Optionally, request a UI-level logout:
+      // await _auth?.logout();
+      return;
+    }
+
+    final uri = Uri.parse("$baseUrl/tasks");
+    debugPrint('[TaskService] GET $uri with token present');
+
     http.Response res;
     try {
-      res = await http.get(Uri.parse("$baseUrl/tasks"),
-          headers: {
-            "Authorization": "Bearer $token",
-            "Content-Type": "application/json"
-          }).timeout(const Duration(seconds: 10));
+      res = await http.get(uri, headers: {
+        "Authorization": "Bearer $token",
+        "Content-Type": "application/json"
+      }).timeout(const Duration(seconds: 10));
     } on TimeoutException {
       isLoading = false;
       notifyListeners();
-      throw 'Request timed out';
+      debugPrint('[TaskService] fetchTasks timeout');
+      return;
+    } catch (e) {
+      isLoading = false;
+      notifyListeners();
+      debugPrint('[TaskService] fetchTasks network error: $e');
+      return;
     }
 
+    debugPrint('[TaskService] fetchTasks status=${res.statusCode} body=${res.body}');
+
     if (res.statusCode == 401) {
-      final ok = await _refreshToken();
-      if (ok) {
+      // try refresh once (ensureAccessToken may have already refreshed)
+      final newToken = await _getValidAccessToken();
+      if (newToken != null && newToken != token) {
+        // retry with refreshed token
         return fetchTasks();
       } else {
         isLoading = false;
         notifyListeners();
-        throw 'Authorization failed';
+        debugPrint('[TaskService] fetchTasks: unauthorized after refresh');
+        // optional: force logout and clear tasks
+        await _auth?.logout();
+        tasks = [];
+        return;
       }
     }
 
     if (res.statusCode == 200) {
-      final data = jsonDecode(res.body);
-
-      // Ensure tasks is a list; backend expected to return List<Map>
-      if (data is List) {
-        tasks = data;
-        // optional: sort by endDate (earliest first) to help UI show due tasks at top
-        try {
-          tasks.sort((a, b) {
-            final aDate = a['endDate'] ?? a['deadline'] ?? a['date'];
-            final bDate = b['endDate'] ?? b['deadline'] ?? b['date'];
-            if (aDate == null && bDate == null) return 0;
-            if (aDate == null) return 1;
-            if (bDate == null) return -1;
-            final da = DateTime.tryParse(aDate) ?? DateTime.fromMillisecondsSinceEpoch(0);
-            final db = DateTime.tryParse(bDate) ?? DateTime.fromMillisecondsSinceEpoch(0);
-            return da.compareTo(db);
-          });
-        } catch (_) {
-          // ignore sorting errors
+      try {
+        final data = jsonDecode(res.body);
+        if (data is List) {
+          tasks = data;
+        } else {
+          tasks = [];
         }
-      } else {
+      } catch (e) {
+        debugPrint('[TaskService] fetchTasks parse error: $e');
         tasks = [];
       }
-
       isLoading = false;
       notifyListeners();
       return;
     }
 
+    debugPrint('[TaskService] fetchTasks unexpected HTTP ${res.statusCode}');
     isLoading = false;
     notifyListeners();
-    throw 'Failed to load tasks';
+    tasks = [];
   }
 
-  /// Add a task. New signature supports startDate, endDate (deadline) and status.
-  ///
-  /// Expects backend to accept fields:
-  ///  - title (string)
-  ///  - description (string)
-  ///  - startDate (ISO string)
-  ///  - endDate (ISO string)
-  ///  - status (string: "not started" | "active" | "completed")
+
+  /// Add a task.
   Future<bool> addTask(
       String title,
       String description,
@@ -119,7 +143,12 @@ class TaskService extends ChangeNotifier {
       DateTime endDate,
       String status,
       ) async {
-    final token = await _getAccessToken();
+    final token = await _getValidAccessToken();
+    if (token == null) {
+      await _auth?.logout();
+      return false;
+    }
+
     final payload = {
       "title": title,
       "description": description,
@@ -128,9 +157,12 @@ class TaskService extends ChangeNotifier {
       "status": status,
     };
 
+    final uri = Uri.parse("$baseUrl/tasks");
+    debugPrint('[TaskService] POST $uri payload=${jsonEncode(payload)}');
+
     try {
       final res = await http
-          .post(Uri.parse("$baseUrl/tasks"),
+          .post(uri,
           headers: {
             "Authorization": "Bearer $token",
             "Content-Type": "application/json"
@@ -138,8 +170,14 @@ class TaskService extends ChangeNotifier {
           body: jsonEncode(payload))
           .timeout(const Duration(seconds: 10));
 
+      debugPrint('[TaskService] addTask status=${res.statusCode} body=${res.body}');
+
       if (res.statusCode == 401) {
-        if (await _refreshToken()) return addTask(title, description, startDate, endDate, status);
+        final refreshedToken = await _getValidAccessToken();
+        if (refreshedToken != null && refreshedToken != token) {
+          return addTask(title, description, startDate, endDate, status);
+        }
+        await _auth?.logout();
         return false;
       }
 
@@ -148,18 +186,32 @@ class TaskService extends ChangeNotifier {
         return true;
       }
 
+      // log server error message
+      final msg = _extractServerMessage(res);
+      debugPrint('[TaskService] addTask failed: $msg');
       return false;
-    } catch (_) {
+    } on TimeoutException {
+      debugPrint('[TaskService] addTask timeout');
+      return false;
+    } catch (e) {
+      debugPrint('[TaskService] addTask error: $e');
       return false;
     }
   }
 
-  /// Update task by id with arbitrary updates map.
   Future<bool> updateTask(String id, Map<String, dynamic> updates) async {
-    final token = await _getAccessToken();
+    final token = await _getValidAccessToken();
+    if (token == null) {
+      await _auth?.logout();
+      return false;
+    }
+
+    final uri = Uri.parse("$baseUrl/tasks/$id");
+    debugPrint('[TaskService] PUT $uri updates=${jsonEncode(updates)}');
+
     try {
       final res = await http
-          .put(Uri.parse("$baseUrl/tasks/$id"),
+          .put(uri,
           headers: {
             "Authorization": "Bearer $token",
             "Content-Type": "application/json"
@@ -167,47 +219,74 @@ class TaskService extends ChangeNotifier {
           body: jsonEncode(updates))
           .timeout(const Duration(seconds: 10));
 
+      debugPrint('[TaskService] updateTask status=${res.statusCode} body=${res.body}');
+
       if (res.statusCode == 401) {
-        if (await _refreshToken()) return updateTask(id, updates);
+        final refreshedToken = await _getValidAccessToken();
+        if (refreshedToken != null && refreshedToken != token) {
+          return updateTask(id, updates);
+        }
+        await _auth?.logout();
         return false;
       }
+
       if (res.statusCode == 200) {
         await fetchTasks();
         return true;
       }
       return false;
-    } catch (_) {
+    } on TimeoutException {
+      debugPrint('[TaskService] updateTask timeout');
+      return false;
+    } catch (e) {
+      debugPrint('[TaskService] updateTask error: $e');
       return false;
     }
   }
 
-  /// Helper: update only status field of a task
   Future<bool> updateTaskStatus(String id, String status) async {
     return updateTask(id, {"status": status});
   }
 
-  /// Delete a task by id.
   Future<bool> deleteTask(String id) async {
-    final token = await _getAccessToken();
+    final token = await _getValidAccessToken();
+    if (token == null) {
+      await _auth?.logout();
+      return false;
+    }
+
+    final uri = Uri.parse("$baseUrl/tasks/$id");
+    debugPrint('[TaskService] DELETE $uri');
+
     try {
       final res = await http
-          .delete(Uri.parse("$baseUrl/tasks/$id"),
-          headers: {
-            "Authorization": "Bearer $token",
-            "Content-Type": "application/json"
-          })
+          .delete(uri, headers: {
+        "Authorization": "Bearer $token",
+        "Content-Type": "application/json"
+      })
           .timeout(const Duration(seconds: 10));
 
+      debugPrint('[TaskService] deleteTask status=${res.statusCode} body=${res.body}');
+
       if (res.statusCode == 401) {
-        if (await _refreshToken()) return deleteTask(id);
+        final refreshedToken = await _getValidAccessToken();
+        if (refreshedToken != null && refreshedToken != token) {
+          return deleteTask(id);
+        }
+        await _auth?.logout();
         return false;
       }
+
       if (res.statusCode == 200) {
         await fetchTasks();
         return true;
       }
       return false;
-    } catch (_) {
+    } on TimeoutException {
+      debugPrint('[TaskService] deleteTask timeout');
+      return false;
+    } catch (e) {
+      debugPrint('[TaskService] deleteTask error: $e');
       return false;
     }
   }
